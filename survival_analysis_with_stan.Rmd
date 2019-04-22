@@ -1,0 +1,124 @@
+---
+title: "Survival Analysis with Stan"
+author: "Laura A Hatfield, Jacob V Spertus"
+date: "April 22, 2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rstan)
+library(tidyverse)
+library(survival)
+library(survminer)
+library(broom)
+```
+
+```{r load_data}
+load("synthetic_data.RData")
+
+treatment_matrix <- model.matrix(~ StentType - 1, data = final.data.set)[,-1]
+covariate_matrix <- final.data.set %>% 
+  select(Age,Male1,Smoker1,PriorMI1,PriorHF1) %>% 
+  as.matrix()
+
+#data list to pass to stan
+data_list <- list(
+  p = ncol(covariate_matrix),
+  k = ncol(treatment_matrix),
+  Nobs = sum(final.data.set$Died == 1),
+  Ncen = sum(final.data.set$Died == 0),
+  Yobs = final.data.set$TimeToFirstOutcome[final.data.set$Died == 1],
+  Ycen = final.data.set$TimeToFirstOutcome[final.data.set$Died == 0],
+  Xobs = covariate_matrix[final.data.set$Died == 1,],
+  Xcen = covariate_matrix[final.data.set$Died == 0,],
+  Tobs = treatment_matrix[final.data.set$Died == 1,],
+  Tcen = treatment_matrix[final.data.set$Died == 0,]
+)
+```
+
+```{r stan_sampling}
+survival_model <- stan_model(file = "survival_analysis.stan")
+survival_fit <- sampling(survival_model, data = data_list, iter = 500, chains = 3)
+```
+
+```{r diagnostics}
+stan_diag(survival_fit)
+stan_rhat(survival_fit)
+stan_par(survival_fit,"beta_0")
+```
+
+```{r reconstruct_curves}
+#reconstruct curves for each patient from each time-to-event model up to 3 years out 
+#note that as calculated here, all predicted probabilities and survival curves are posterior means.
+x <- seq(.01,3,length.out = 20)
+
+
+################### survival #################
+params <- tidyMCMC(survival_fit, conf.int = T, conf.level = .95) 
+mean_shape <- params$estimate[params$term == 'alpha']
+scale_coefs_survival <- rstan::extract(survival_fit, pars = c('beta_0','beta_t','beta_x')) %>%
+  purrr::reduce(cbind)
+
+# bms
+fitted_scales_survival_bms <- cbind(1, treatment_matrix_bms, covariate_matrix) %*%
+  t(scale_coefs_survival)
+mean_scales_survival_bms <- rowMeans(fitted_scales_survival_bms)
+survival_curves_bms <- matrix(0, nrow = nrow(treatment_matrix), ncol = length(x))
+
+#everolimus
+fitted_scales_survival_everolimus <- cbind(1, treatment_matrix_everolimus, covariate_matrix) %*%
+  t(scale_coefs_survival)
+mean_scales_survival_everolimus <- rowMeans(fitted_scales_survival_everolimus)
+survival_curves_everolimus <- matrix(0, nrow = nrow(treatment_matrix), ncol = length(x))
+
+for(i in 1:nrow(treatment_matrix)){
+  scale_bms <- exp(-mean_scales_survival_bms[i] / mean_shape)
+  scale_everolimus <- exp(-mean_scales_survival_everolimus[i] / mean_shape)
+  scale_paclitaxel <- exp(-mean_scales_survival_paclitaxel[i] / mean_shape)
+  scale_sirolimus <- exp(-mean_scales_survival_sirolimus[i] / mean_shape)
+  scale_zotarolimus <- exp(-mean_scales_survival_zotarolimus[i] / mean_shape)
+  survival_curves_bms[i,] <- exp(-(x / scale_bms)^mean_shape)
+  survival_curves_everolimus[i,] <- exp(-(x / scale_everolimus)^mean_shape)
+  survival_curves_paclitaxel[i,] <- exp(-(x / scale_paclitaxel)^mean_shape)
+  survival_curves_sirolimus[i,] <- exp(-(x / scale_sirolimus)^mean_shape)
+  survival_curves_zotarolimus[i,] <- exp(-(x / scale_zotarolimus)^mean_shape)
+}
+
+```
+
+```{r plot_survival_curves}
+#long dataframe with columns for time, subject, probability, and identifier for outcome. Don't keep all subjects.
+curve_frame <- bind_rows(
+  melt(t(survival_curves_everolimus),  varnames = c("time","subject")) %>% 
+    mutate(outcome = 'survival', stent = 'everolimus'),
+ melt(t(survival_curves_bms),  varnames = c("time","subject")) %>% 
+   mutate(outcome = 'survival', stent = 'bms')) %>%
+  mutate(time = x[time])
+#plot survival curves using frame and ggplot
+curve_plot <- ggplot(curve_frame %>% filter(between(subject, 1, 200)), aes(x = time, y = value, group = as.factor(subject))) +
+  geom_line() +
+  facet_grid(~stent) + 
+  ylim(0,1) +
+  xlab("Time (Years)") +
+  ylab("Probability of Event") +
+  ggtitle("Survival Curves for 200 Subjects under Everolimus")
+curve_plot
+```
+
+```{r hazard_ratios}
+hazards <- params %>% 
+  filter(term != "alpha", term != 'beta_0') %>%
+  mutate(hazard = exp(estimate), conf.low = exp(conf.low), conf.high = exp(conf.high)) %>% 
+  mutate(named_terms = c(colnames(treatment_matrix), colnames(covariate_matrix))) %>%
+  select(named_terms, hazard, conf.low, conf.high)
+hazards_plot <- ggplot(hazards, aes(x = named_terms, y = hazard, ymin = conf.low, ymax = conf.high)) +
+  geom_hline(yintercept = 1, linetype = 'dashed', size = 1, color = 'darkorange3') +
+  geom_pointrange(colour = "steelblue") +
+  theme_bw() +
+  coord_flip()
+hazards_plot
+```
+
